@@ -1,0 +1,85 @@
+# Build and deploy the pull-request analyzer. Run this file with the service
+# directory as the build context. It does not deploy Contributor Conclave.
+# Secret values are names only. Cloud Run reads them from Secret Manager.
+
+substitutions:
+  _REGION: us-central1
+  _AR_REPOSITORY: contributor-conclave
+  _SERVICE: pr-analyzer-service
+  _RUN_SERVICE_ACCOUNT: pr-analyzer-run
+  _ANALYSIS_TOKEN_SECRET: pr-analyzer-token
+  _GITHUB_TOKEN_SECRET: pr-analyzer-github-token
+  _MIN_INSTANCES: "0"
+  _MAX_INSTANCES: "3"
+  _MEMORY: 512Mi
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 1200s
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPOSITORY}/pr-analyzer-service:$BUILD_ID
+      - .
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPOSITORY}/pr-analyzer-service:$BUILD_ID
+
+  - id: deploy
+    name: gcr.io/cloud-builders/gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPOSITORY}/pr-analyzer-service:$BUILD_ID
+      - --region
+      - ${_REGION}
+      - --project
+      - $PROJECT_ID
+      - --service-account
+      - ${_RUN_SERVICE_ACCOUNT}@$PROJECT_ID.iam.gserviceaccount.com
+      - --port
+      - "8080"
+      - --cpu
+      - "1"
+      - --memory
+      - ${_MEMORY}
+      - --min-instances
+      - ${_MIN_INSTANCES}
+      - --max-instances
+      - ${_MAX_INSTANCES}
+      - --timeout
+      - "60s"
+      - --set-env-vars
+      - FIRESTORE_ENABLED=true,FIRESTORE_COLLECTION=prAnalyses
+      - --set-secrets
+      - ANALYSIS_TOKEN=${_ANALYSIS_TOKEN_SECRET}:latest,GITHUB_TOKEN=${_GITHUB_TOKEN_SECRET}:latest
+      - --allow-unauthenticated
+      - --quiet
+
+  - id: smoke-test
+    name: gcr.io/cloud-builders/gcloud
+    entrypoint: bash
+    args:
+      - -eu
+      - -c
+      - |
+        URL="$$(gcloud run services describe ${_SERVICE} --region ${_REGION} --project $PROJECT_ID --format='value(status.url)')"
+        for _ in 1 2 3 4 5 6; do
+          if python3 -c 'import sys, urllib.request; urllib.request.urlopen(sys.argv[1], timeout=20)' "$$URL/health"; then
+            echo "Smoke test returned 200"
+            exit 0
+          fi
+          sleep 5
+        done
+        echo "Smoke test failed"
+        exit 1
